@@ -2,8 +2,8 @@ import os
 import torch
 import torch.nn.functional as F
 from torch.optim import Adam
-from utils import soft_update, hard_update
-from model import GaussianPolicy, QNetwork, DeterministicPolicy
+from .utils import soft_update, hard_update
+from .model import GaussianPolicy, QNetwork, DeterministicPolicy, BetaPolicy, GsdeGaussianPolicy
 
 
 class SAC(object):
@@ -30,16 +30,45 @@ class SAC(object):
             if self.automatic_entropy_tuning is True:
                 self.target_entropy = -torch.prod(torch.Tensor(action_space.shape).to(self.device)).item()
                 self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
-                self.alpha_optim = Adam([self.log_alpha], lr=args.lr)
+                self.alpha_optim = Adam([self.log_alpha], lr=args.lr * 0.1)
 
             self.policy = GaussianPolicy(num_inputs, action_space.shape[0], args.hidden_size, action_space).to(self.device)
             self.policy_optim = Adam(self.policy.parameters(), lr=args.lr)
+        elif self.policy_type == "Beta":
+            if self.automatic_entropy_tuning is True:
+                self.target_entropy = -torch.prod(torch.Tensor(action_space.shape).to(self.device)).item()
+                self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+                self.alpha_optim = Adam([self.log_alpha], lr=args.lr)
 
+            self.policy = BetaPolicy(num_inputs, action_space.shape[0], args.hidden_size, action_space).to(self.device)
+            self.policy_optim = Adam(self.policy.parameters(), lr=args.lr)
+        elif self.policy_type in ("gSDE", "GsdeGaussian"):
+            # gSDE: 상태 의존 std 증폭 + 롤아웃 단위 고정 노이즈 행렬
+            if self.automatic_entropy_tuning:
+                self.target_entropy = -torch.prod(torch.Tensor(action_space.shape).to(self.device)).item() * 0.5
+                self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+                self.alpha_optim = Adam([self.log_alpha], lr=args.lr * 0.1)
+
+            # args.sde_sigma가 없으면 기본 0.5 사용
+            sde_sigma = getattr(args, "sde_sigma", 0.5)
+            self.policy = GsdeGaussianPolicy(
+                num_inputs,
+                action_space.shape[0],
+                args.hidden_size,
+                action_space,
+                sde_sigma=sde_sigma,
+                use_layernorm=False  # 필요하면 True
+            ).to(self.device)
+            self.policy_optim = Adam(self.policy.parameters(), lr=args.lr)
         else:
             self.alpha = 0
             self.automatic_entropy_tuning = False
             self.policy = DeterministicPolicy(num_inputs, action_space.shape[0], args.hidden_size, action_space).to(self.device)
             self.policy_optim = Adam(self.policy.parameters(), lr=args.lr)
+
+    def reset_policy_noise(self, std: float = 1.0):
+        if hasattr(self.policy, "reset_noise"):
+            self.policy.reset_noise(std)
 
     def select_action(self, state, evaluate=False):
         state = torch.FloatTensor(state).to(self.device).unsqueeze(0)
@@ -50,8 +79,18 @@ class SAC(object):
         return action.detach().cpu().numpy()[0]
 
     def update_parameters(self, memory, batch_size, updates):
-        # Sample a batch from memory
-        state_batch, action_batch, reward_batch, next_state_batch, mask_batch = memory.sample(batch_size=batch_size)
+        # Check if using PER or regular memory
+        use_per = hasattr(memory, 'update_priorities')
+        
+        if use_per:
+            # Sample with PER
+            (state_batch, action_batch, reward_batch, next_state_batch, mask_batch), indices, weights = memory.sample(batch_size)
+            weights = torch.FloatTensor(weights).to(self.device).unsqueeze(1)
+        else:
+            # Sample with regular memory
+            state_batch, action_batch, reward_batch, next_state_batch, mask_batch = memory.sample(batch_size=batch_size)
+            weights = torch.ones(batch_size, 1).to(self.device)  # Uniform weights for regular replay
+            indices = None
 
         state_batch = torch.FloatTensor(state_batch).to(self.device)
         next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
@@ -64,9 +103,18 @@ class SAC(object):
             qf1_next_target, qf2_next_target = self.critic_target(next_state_batch, next_state_action)
             min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
             next_q_value = reward_batch + mask_batch * self.gamma * (min_qf_next_target)
+            
         qf1, qf2 = self.critic(state_batch, action_batch)  # Two Q-functions to mitigate positive bias in the policy improvement step
-        qf1_loss = F.mse_loss(qf1, next_q_value)  # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
-        qf2_loss = F.mse_loss(qf2, next_q_value)  # JQ = 𝔼(st,at)~D[0.5(Q1(st,at) - r(st,at) - γ(𝔼st+1~p[V(st+1)]))^2]
+        
+        # Calculate TD errors for PER priority update
+        qf1_td_error = qf1 - next_q_value
+        qf2_td_error = qf2 - next_q_value
+        
+        # Apply importance sampling weights to losses
+        # qf1_loss = (F.mse_loss(qf1, next_q_value, reduction='none') * weights).mean()
+        # qf2_loss = (F.mse_loss(qf2, next_q_value, reduction='none') * weights).mean()
+        qf1_loss = (F.smooth_l1_loss(qf1, next_q_value, reduction='none') * weights).mean()
+        qf2_loss = (F.smooth_l1_loss(qf2, next_q_value, reduction='none') * weights).mean()
         qf_loss = qf1_loss + qf2_loss
 
         self.critic_optim.zero_grad()
@@ -78,11 +126,18 @@ class SAC(object):
         qf1_pi, qf2_pi = self.critic(state_batch, pi)
         min_qf_pi = torch.min(qf1_pi, qf2_pi)
 
-        policy_loss = ((self.alpha * log_pi) - min_qf_pi).mean() # Jπ = 𝔼st∼D,εt∼N[α * logπ(f(εt;st)|st) − Q(st,f(εt;st))]
+        policy_loss = (weights * ((self.alpha * log_pi) - min_qf_pi)).mean() # Apply IS weights to policy loss
 
         self.policy_optim.zero_grad()
         policy_loss.backward()
         self.policy_optim.step()
+        
+        # Update priorities for PER
+        if use_per and indices is not None:
+            # Use the minimum TD error for priority update
+            td_errors = torch.min(torch.abs(qf1_td_error), torch.abs(qf2_td_error))
+            priorities = td_errors.detach().cpu().numpy().flatten()
+            memory.update_priorities(indices, priorities)
 
         if self.automatic_entropy_tuning:
             alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
@@ -91,7 +146,7 @@ class SAC(object):
             alpha_loss.backward()
             self.alpha_optim.step()
 
-            self.alpha = self.log_alpha.exp()
+            self.alpha = torch.clamp(self.log_alpha.exp(), min=1e-3)
             alpha_tlogs = self.alpha.clone() # For TensorboardX logs
         else:
             alpha_loss = torch.tensor(0.).to(self.device)
